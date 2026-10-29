@@ -64,6 +64,16 @@ HELD = set(plan.get('held', []))
 log = lambda *a: print(*a, flush=True)
 ctx, cs = whole_ctx.plan()
 cfg = ctx.cfg
+# a SINGLE the snap finds no path for at its width is searched again with its end stretches -- the face band at each
+# end (whole_solve.FACE_ROOM along its line) -- read at the width the lay may narrow a track to: the fab escalation's
+# first rung (fab_tiers.escalation_rungs, none under --escalation off), never wider than the escape's own stub. The lay
+# narrows the same stretches, only where its own full-width search is refused (braid.route_lane_necked)
+import rules as _rules  # noqa: E402
+import fab_tiers as _ft  # noqa: E402
+_rg = _ft.escalation_rungs(len(cfg.layers))
+NECK_W = min(_rules.active().fan_track, _rg[0]['track_width']) if _rg else None
+if NECK_W is not None and NECK_W >= cfg.track_width - 1e-9:
+    NECK_W = None
 g = cfg.grid_step
 TW, CL, VR = cfg.track_width, cfg.clearance, cfg.via_size / 2
 h2h = getattr(cfg, 'hole_to_hole_clearance', 0.0) or 0.0
@@ -112,16 +122,22 @@ LIDX = {L: k for k, L in enumerate(cfg.layers)}
 STATIC = {}
 
 
-def static_masks(n, i0, j0, band):
+def static_masks(n, i0, j0, band, width=None):
     """the board's fixed copper as the router itself stamps it: its base obstacle map (obstacle_map.
     build_base_obstacle_map: pads with their corner buffers, other nets' stubs, vias and holes, the board edge) over
     lane n's window with n's own nets excluded -- a pair's with the pair's extra clearance, half its pitch, as the
     pair step builds it -- and n's own pads' via keep-outs. Read at the cells n can use: track cells per layer, and
     the cells where a via of n clears (a pair's: the centre and the two barrels the pair router checks, SPC cells
     along each heading's integer perpendicular). Cached: static copper does not move between sweeps"""
-    key = (n, i0, j0, band.shape)
+    key = (n, i0, j0, band.shape, width)
     if key in STATIC:
         return STATIC[key]
+    cfg = globals()['cfg']
+    if width is not None:
+        # (a single's end stretches: the cells read for a track `width` wide -- the neck the lay may lay there)
+        import copy as _copy
+        cfg = _copy.copy(cfg)
+        cfg.track_width = width
     NI, NJ = band.shape
     R = SPC if n in prs else 0
     x0, y0, x1, y1 = (i0 - R) * g, (j0 - R) * g, (i0 + NI + R) * g, (j0 + NJ + R) * g
@@ -550,7 +566,7 @@ def lane_bar(n, m):
     return TW + CL + hw[n] + hw[m] + g / 2 * (OFFG[n] + OFFG[m])
 
 
-def build(n):
+def build(n, neck=False):
     """lane n's search window: band cells, their distance from the smooth line and arc position, the forbidden
     cells per layer for its centre, the cells where its via clears, the soft price of lanes not yet placed"""
     P = LANE[n]['pts']
@@ -614,6 +630,14 @@ def build(n):
     box = lambda p_, q_: (min(p_[0], q_[0]), min(p_[1], q_[1]), max(p_[0], q_[0]), max(p_[1], q_[1]))
     # the board's fixed copper: the router's own base map (static_masks)
     st_trk, st_via = static_masks(n, i0, j0, band)
+    if neck and n not in prs:
+        # (a single refused at its width) its first and last FACE_ROOM of line read at the neck's width: a berth whose
+        # exit stands within a lane's bar of another part's pad -- a pull resistor 0.16 mm past the face, on the stub's
+        # row -- left the snap no path into it at the full width, and the held plan dropped a lane the lay could lay
+        import whole_solve as _ws
+        st_fan, _sv = static_masks(n, i0, j0, band, width=NECK_W)
+        near_ = band & ((arc < _ws.FACE_ROOM) | (arc > s0 - _ws.FACE_ROOM))
+        st_trk = {L_: np.where(near_, st_fan[L_], a_) for L_, a_ in st_trk.items()}
     for L in bad:
         bad[L] |= st_trk[L]
     DBG_ = n in (awx_settings.get('SNAP_DEBUG') or '').split(',') or awx_settings.get('SNAP_DEBUG') == '*'
@@ -908,12 +932,24 @@ def via_arcs(n):
 
 
 def route(n, strict=True, wide=False):
+    """_route at the lane's width, and -- a single it refuses, where the fab escalation may narrow a track (NECK_W) --
+    again with its end stretches read at that narrower width"""
+    r_ = _route(n, strict, wide)
+    if r_[0] is None and NECK_W is not None and n not in prs:
+        r2_ = _route(n, strict, wide, neck=True)
+        if r2_[0] is not None:
+            print(f'  {n} laid with its end stretches at {NECK_W:g} mm (refused at {TW:g}: {str(r_[1])[:90]})')
+            return r2_
+    return r_
+
+
+def _route(n, strict=True, wide=False, neck=False):
     """A* over (cell, direction, vias taken): the lane's octilinear grid path, or None. strict: every move within a
     track width of an end runs within 90 degrees of its stub's own way. wide: each layer change within RVIA_WIDE of the
     plan's via, not RVIA, and each layer's run as much farther along the lane -- the last try of a lane whose changes
     find no room within RVIA"""
     rvia = RVIA_WIDE if wide else RVIA
-    W = build(n)
+    W = build(n, neck=neck)
     XROOM.clear()
     XROOM.update(mask=W.get('xroom'), i0=W['i0'], j0=W['j0'])
     i0, j0, band, bad, vbad, dist, arc = W['i0'], W['j0'], W['band'], W['bad'], W['vbad'], W['dist'], W['arc']

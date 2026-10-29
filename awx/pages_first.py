@@ -50,6 +50,7 @@ from __future__ import annotations
 import math
 import os
 import awx_settings
+import cp_seed  # noqa: E402  (every CP-SAT solve under the bus step's seed)
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -979,7 +980,7 @@ def _solve(st, board, log, fixed, learned, src_free, seed, src_seed, hold_s=None
                         'src_seed': {n: [mv.kind, mv.direction, mv.layer, list(mv.exit_pt)]
                                      for n, mv in (src_seed or {}).items()}}, _f, indent=1)
         log(f'  pages-first: instance written to {_stem}.pb')
-    solver = cp_model.CpSolver()
+    solver = cp_seed.solver()
     solver.parameters.num_workers = PAGES_WORKERS
     solver.parameters.interleave_search = True
     solver.parameters.max_deterministic_time = PAGES_DET

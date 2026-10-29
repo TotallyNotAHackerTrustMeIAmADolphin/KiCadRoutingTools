@@ -4340,6 +4340,10 @@ class Corridor:
                 if added:
                     del ctx.pcb.segments[-added:]
                     ctx.pcb.vias = ctx.pcb.vias[:len(ctx.pcb.vias) - len(vias_all)]
+                # (a whole-route plan's single, refused at its width: again with its end stretches narrowed, as the
+                # snap read them -- route_lane_necked)
+                if getattr(self, '_geo', None):
+                    return route_lane_necked(self, nm, nid, virt, virt_vias, band, margin)
                 return None
             segs_o, vias_o = res
             ctx.pcb.segments.extend(segs_o)
@@ -7802,6 +7806,77 @@ def write_out(a, ctx, corridors, names, log):
         + (f' -- {len(refused)} net(s) REFUSED' if refused else '')
         + (f' -- {len(_jump)} VIA-LESS LAYER CHANGE(S)' if _jump else ''))
     return 1 if refused else 0
+
+
+# (a module function, not a method: the whole route's PlanLanes borrows route_lane alone)
+def route_lane_necked(self, nm, nid, virt, virt_vias, band, margin):
+    """A single its full-width search refused (route_lane), laid again in three hops along its planned line: from
+    its tooth to the face band's end (whole_solve.FACE_ROOM along the line) at the width the lay may narrow a track
+    to (the fab escalation's first rung, never wider than the escape's stub), on at its own width, and the last face
+    band into its stub at the narrow width again -- the snap's own reading of its end stretches (whole_snap), the
+    narrowing disclosed in the fab ledger. A hop's waypoint stands on the plan's line, on the plan's layer there.
+    (segments, vias) or None; partial copper is discarded"""
+    import copy as _copy
+    import fab_tiers as _ft
+    import whole_solve as _ws
+    ctx = self.ctx
+    rg_ = _ft.escalation_rungs(len(ctx.cfg.layers))
+    if not rg_ or not getattr(self, '_geo', None) or nm not in self._geo.get('lanes', {}):
+        return None
+    w_n = min(_rules.active().fan_track, rg_[0]['track_width'])
+    if w_n >= ctx.cfg.track_width - 1e-9:
+        return None
+    R_ = _ws.FACE_ROOM
+    xy = [tuple(map(float, p)) for p in self.lane_xy[nm]]
+    cum = [0.0]
+    for p, q in zip(xy, xy[1:]):
+        cum.append(cum[-1] + math.hypot(q[0] - p[0], q[1] - p[1]))
+    Lt = cum[-1]
+
+    def at_(s_):
+        for k in range(len(xy) - 1):
+            if cum[k + 1] >= s_ and cum[k + 1] - cum[k] > 1e-12:
+                u = (s_ - cum[k]) / (cum[k + 1] - cum[k])
+                return (xy[k][0] + (xy[k + 1][0] - xy[k][0]) * u, xy[k][1] + (xy[k + 1][1] - xy[k][1]) * u)
+        return xy[-1]
+    pcs_ = self._geo['lanes'][nm]['pieces']
+
+    def layer_at(p):
+        def d_(pc):
+            ax, ay, bx, by = pc[:4]
+            L2 = (bx - ax) ** 2 + (by - ay) ** 2
+            t = 0.0 if L2 < 1e-18 else max(0.0, min(1.0, ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / L2))
+            return math.hypot(ax + t * (bx - ax) - p[0], ay + t * (by - ay) - p[1])
+        return min(pcs_, key=d_)[4]
+    a, aL = self.teeth[nm], ctx.tooth_layer[nm]
+    b, bL = self.stubs[nm], ctx.dest_layer[nm]
+    if Lt <= 2 * R_ + 2 * ctx.cfg.grid_step:
+        hops = [(a, aL, b, bL, w_n)]
+    else:
+        P1, P2 = at_(R_), at_(Lt - R_)
+        L1, L2 = layer_at(P1), layer_at(P2)
+        hops = [(a, aL, P1, L1, w_n), (P1, L1, P2, L2, None), (P2, L2, b, bL, w_n)]
+    segs_all, vias_all = [], []
+    n_s, n_v = len(ctx.pcb.segments), len(ctx.pcb.vias)
+    for p, pL, q, qL, w in hops:
+        cfg_ = ctx.cfg
+        if w is not None:
+            cfg_ = _copy.copy(ctx.cfg)
+            cfg_.track_width = w
+        res = cn.connect(ctx.pcb, nid, p, pL, q, qL, cfg_, band=band, virtual=virt, margin=margin,
+                         window_pts=xy, virtual_vias=virt_vias)
+        if res is None:
+            del ctx.pcb.segments[n_s:]
+            del ctx.pcb.vias[n_v:]
+            return None
+        ctx.pcb.segments.extend(res[0])
+        ctx.pcb.vias.extend(res[1])
+        segs_all.extend(res[0])
+        vias_all.extend(res[1])
+    _ft.note_narrowing(nid, 'track_width', ctx.cfg.track_width, w_n, 'bus lane end stretch',
+                       count=sum(1 for s_ in segs_all if s_.width < ctx.cfg.track_width - 1e-9), net_name=nm)
+    print(f'{nm:7s} laid with its end stretches at {w_n:g} mm (refused at {ctx.cfg.track_width:g})')
+    return segs_all, vias_all
 
 
 if __name__ == '__main__':

@@ -30,6 +30,7 @@ plan is solved again as its CROWD diagnosis, and the lanes whose crossings the e
 OUT.crowded.json (solve(crowd=True))."""
 import sys, os, re, itertools, collections, json, math, hashlib, time
 import awx_settings
+import cp_seed  # noqa: E402  (every CP-SAT solve under the bus step's seed)
 import whole_ctx
 import whole_frame
 import route_layers
@@ -174,7 +175,7 @@ def _room_tie(m, sv, t, chg, YL, M, ROOM_T, G):
     for i_ in range(n0):
         mc.AddHint(mc.GetIntVarFromProtoIndex(i_), sv.Value(m.GetIntVarFromProtoIndex(i_)))
     mc.Minimize(sum(terms))
-    s_ = cp_model.CpSolver()
+    s_ = cp_seed.solver()
     s_.parameters.num_workers = SOLVE_WORKERS
     s_.parameters.subsolvers.extend(FALLBACK)
     s_.parameters.interleave_search = True
@@ -238,7 +239,7 @@ def _plane_tie(ctx, m, sv, OBJ, t, chg, YL, M, entry, end, LAYN, KMAX, Q):
         m.AddHint(v_, sv.Value(v_))
     old = {(n, k): sv.Value(YL[n][k]) for (n, k) in runs}
     m.Minimize(sum(terms))
-    s_ = cp_model.CpSolver()
+    s_ = cp_seed.solver()
     s_.parameters.num_workers = SOLVE_WORKERS
     s_.parameters.subsolvers.extend(FALLBACK)
     s_.parameters.interleave_search = True
@@ -258,7 +259,7 @@ def _plane_tie(ctx, m, sv, OBJ, t, chg, YL, M, entry, end, LAYN, KMAX, Q):
 
 
 def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, relax=0, front=None, check=False,
-          core=False, rules=False):
+          core=False, rules=False, lanecore=False):
     """the solve of the bench ctx (whole_ctx.plan()) round the destination part `dest`: the JSON
     whole_geo reads (crossings, changes, each lane's route coordinate), or None when CP-SAT finds no plan or none it
     proves optimal in its vias. `cuts`
@@ -382,10 +383,29 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # tooth had no room beside it (K28: SDQ11 0.47 and SCKE1 0.59 past theirs, each moved by a via cut a round later).
     # Its crossings keep their own windows
     END_ROOM = 2 * VNEED
+    # (the fanout's plan sidecar beside the bench, when no candidate's ends are given: its escape flag and blocked fronts)
+    SIDE = {}
+    if front is None:
+        try:
+            _side = os.path.splitext(awx_settings.req('BENCH'))[0] + '.plan.json'
+            SIDE = json.load(open(_side)) if os.path.isfile(_side) else {}
+        except Exception:
+            SIDE = {}
     VIN0 = {n: (_pairs.dive_room(ctx.cfg, ctx.pair_ends[n][0], _axis(ctx.tooth_dir.get(n))) if n in prs else END_ROOM)
             for n in M}
     VIN1 = {n: (_pairs.dive_room(ctx.cfg, ctx.pair_ends[n][1], _axis(ctx.stub_dir.get(n))) if n in prs else END_ROOM)
             for n in M}
+    # ...and, on ESCAPE ends, every change stands outside both arrays' FACE ZONES -- the band in front of a face where
+    # the ends' own copper is (two via rooms and a lane pitch), its own via room beyond it: inside, a dive has no room
+    # beside it, the neighbours not yet spread from the array (a dive in a lane of 3.5 mm or less laid 20-34% open
+    # against 4-8% without). Escape ends are checked against this solve before they are laid (whole_ends.solve_check:
+    # a candidate's, FRONT given; the plan sidecar's 'escape' for the round's), so a lane's layer near the arrays is
+    # the ends' to choose. Other ends were never chosen for it: a short lane, its crossings packed near the faces, has
+    # no window left for a change
+    FACE_ZONE = 3 * VNEED + PITCH
+    if front is not None or SIDE.get('escape'):
+        VIN0 = {n: max(v_, FACE_ZONE) for n, v_ in VIN0.items()}
+        VIN1 = {n: max(v_, FACE_ZONE) for n, v_ in VIN1.items()}
     # ...a CROSSED pair's (pairs.opposite_hands: its legs swap once, at its first dive, a crossover) by the crossover's
     # own runs (pairs.crossover_room) -- its first change from its tooth, and at its berth where that change is its only
     # one; its other changes are plain dives, and its changes' cuts are the crossover's, the longer
@@ -393,15 +413,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # change before it: whole_ends FRONT_VIA; the fanout's plan sidecar, ends_model.front): the lane stands on the OTHER
     # layer across that copper (a LAYER cut, below), its change between the stub and the copper -- its end room there a
     # via's own. A ring lane's berth stub runs across its ring, not along its route: its front is the geometry's
-    FRONT = {}
-    if front is not None:
-        FRONT = front                  # (a candidate's, the ends model's own: solve_check)
-    else:
-        try:
-            _side = os.path.splitext(awx_settings.req('BENCH'))[0] + '.plan.json'
-            FRONT = (json.load(open(_side)).get('ends_model') or {}).get('front') or {} if os.path.isfile(_side) else {}
-        except Exception:
-            FRONT = {}
+    FRONT = front if front is not None else ((SIDE.get('ends_model') or {}).get('front') or {})
     LAYER_CUTS = []
     FAR = set(getattr(Fr, 'far', ()))      # (a far-face lane's tooth: its route starts round the source's corner)
     for n, ends_ in sorted(FRONT.items()):
@@ -662,6 +674,8 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     RLIT = {}
 
     def rlit(n_, fam):
+        if lanecore:
+            fam = '*'                  # (lanecore: every rule of a lane on one literal -- the core names LANES)
         if (n_, fam) not in RLIT:
             RLIT[(n_, fam)] = m.NewBoolVar(f'rule_{n_}_{fam}')
         return RLIT[(n_, fam)]
@@ -1954,7 +1968,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     if check and not CROWD:
         # (whole_ends.solve_check: has this model a plan at all? Its first plan ends the search -- the verdict alone)
         m.ClearObjective()
-        s_ = cp_model.CpSolver()
+        s_ = cp_seed.solver()
         # (the rules' assumptions with no crossing as well: unassumed, a rule's literal was free, and a lane with no
         # crossing and no change position read 'plan' with its rules dropped)
         s_.parameters.num_workers = 1 if WLIT or RLIT else SOLVE_WORKERS        # (a core is one worker's)
@@ -1965,6 +1979,9 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
         st_ = s_.Solve(m)
         STATUS['plan'] = st_ in (cp_model.OPTIMAL, cp_model.FEASIBLE)
         out_ = {'plan': STATUS['plan'], 'status': s_.StatusName(st_), 'crossings': len(t), 'lanes': len(M)}
+        # (the lanes with no room for a change on these ends -- each a fact of its own tooth and berth alone: those two
+        # ends on one layer, whatever the rest; whole_ends' joint loop holds such a lane to one layer)
+        out_['nochange'] = sorted(n_ for n_ in M if CDOM[n_][0] >= CDOM[n_][1])
         if (WLIT or RLIT) and st_ == cp_model.INFEASIBLE:
             suff_ = list(s_.SufficientAssumptionsForInfeasibility())
             out_['core'] = sorted({WLIT[i_] for i_ in suff_ if i_ in WLIT})
@@ -1978,7 +1995,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
                 for k_ in list(keep_)[:CHECK_RULES_MAX]:
                     m.ClearAssumptions()
                     m.AddAssumptions(wl_ + [RLIT[k2_] for k2_ in keep_ if k2_ != k_])
-                    s2_ = cp_model.CpSolver()
+                    s2_ = cp_seed.solver()
                     s2_.parameters.num_workers = 1
                     s2_.parameters.max_deterministic_time = CHECK_WORK / 6
                     if s2_.Solve(m) == cp_model.INFEASIBLE:
@@ -1990,7 +2007,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
                 for _it in range(CHECK_RULES_CORES):
                     m.ClearAssumptions()
                     m.AddAssumptions(wl_ + [v_ for k_, v_ in RLIT.items() if k_ not in free_])
-                    s3_ = cp_model.CpSolver()
+                    s3_ = cp_seed.solver()
                     s3_.parameters.num_workers = 1
                     s3_.parameters.max_deterministic_time = CHECK_WORK
                     if s3_.Solve(m) != cp_model.INFEASIBLE:
@@ -2001,7 +2018,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
                     for k_ in list(nxt_):
                         m.ClearAssumptions()
                         m.AddAssumptions(wl_ + [RLIT[k2_] for k2_ in nxt_ if k2_ != k_])
-                        s4_ = cp_model.CpSolver()
+                        s4_ = cp_seed.solver()
                         s4_.parameters.num_workers = 1
                         s4_.parameters.max_deterministic_time = CHECK_WORK / 6
                         if s4_.Solve(m) == cp_model.INFEASIBLE:
@@ -2022,7 +2039,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # most of it on the tie-break). (A gap limit of a via would stop short of that proof: a plan of 24 vias against a
     # bound of 23 and half a via's history is within one via, and a 23-via plan may still exist.)
     def once(subs, batches, known_):
-        s_ = cp_model.CpSolver()
+        s_ = cp_seed.solver()
         s_.parameters.num_workers = SOLVE_WORKERS
         s_.parameters.subsolvers.extend(subs)
         # REPRODUCIBLE: stopped by a count of interleaved batches, the workers sharing no clauses. Measured on this
@@ -2076,7 +2093,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # and taken only when the search proves no plan of its own: where the search proves one, nothing changes
     warm = None
     if hint and root is not None:
-        sw = cp_model.CpSolver()
+        sw = cp_seed.solver()
         sw.parameters.num_workers = 1
         sw.parameters.fix_variables_to_their_hinted_value = True
         sw.parameters.max_deterministic_time = WARM_WORK
@@ -2088,7 +2105,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # re-solve -- the rest of the plan unhinted, nothing for its neighbourhood searches to start from. Laid out (0.1 s
     # there), the search has a plan from its first batch
     if hint:
-        sh = cp_model.CpSolver()
+        sh = cp_seed.solver()
         sh.parameters.num_workers = 1
         sh.parameters.fix_variables_to_their_hinted_value = True
         sh.parameters.max_deterministic_time = WARM_WORK
@@ -2132,7 +2149,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
             that batch its price (8 to 14 s on a bus of 40 lanes)"""
             if first_:
                 model_.ClearObjective()
-            sf_ = cp_model.CpSolver()
+            sf_ = cp_seed.solver()
             sf_.parameters.num_workers = 1 if one_ else SOLVE_WORKERS
             sf_.parameters.interleave_search = True
             sf_.parameters.max_num_deterministic_batches = batches_
@@ -2289,7 +2306,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
             v_ = m.GetIntVarFromProtoIndex(i_)
             m.AddHint(v_, sv.Value(v_))
         m.Add(OBJ <= best_)
-        s2_ = cp_model.CpSolver()
+        s2_ = cp_seed.solver()
         s2_.parameters.num_workers = SOLVE_WORKERS
         s2_.parameters.subsolvers.extend(SUBSOLVERS)
         s2_.parameters.interleave_search = True

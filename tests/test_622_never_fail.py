@@ -13,21 +13,18 @@ those decisions rest on, without a bench to route:
    and in pieces both count;
 2. route_bus.open_nets: the same log read as the open nets' names (short, the
    bench's '/DDR3 16x1/SDQ15' read as SDQ15);
-3. add_over: the lanes an unproved plan leaves over two vias merged into the
-   fanout's feedback ('over'), the lanes it newly names returned, a lane raised
-   only by more, and the audits' own feedback (pairs, avoid) left as it was;
-4. held_plan: a loop's snapped plan when it has one; nothing when it held none; and its best round's plan snapped,
+3. held_plan: a loop's snapped plan when it has one; nothing when it held none; and its best round's plan snapped,
    and laid (plan_bench), on THAT round's bench -- not the first round's, whose via ends another solve relayed;
-5. whole_feedback --refused: the fanout audit's split pair (SDQS0 at its berth, SDQ3 between its tips) fed back
-   as the two lanes' berths not to be chosen together -- the next round, incremental, frees both -- and a tooth on
-   the source's far face (SDQ7) as an end to avoid;
-6. whole_feedback --name: a round that left nets open names their lanes (a leg read as its pair), and one that
+4. whole_feedback --refused: the fanout audit's split pair (SDQS0 at its berth, SDQ3 between its tips) named as
+   the two lanes' berths not to be chosen together, and a tooth on the source's far face (SDQ7) as an end to avoid --
+   what the last resort leaves out when no round laid anything;
+5. whole_feedback --name: a round that left nets open names their lanes (a leg read as its pair), and one that
    laid nothing names lanes from the ends model's reading -- its nets over two first, then (named again) its lanes
    loaded past LOAD_OK, then its most crossed -- both ends of each to avoid, the lanes kept in 'named' in the order
    named, and nothing new once every tier is spent;
-7. partial_drops: the last resort's sets of lanes left out, each larger -- the named, then to a quarter, then to half
+6. partial_drops: the last resort's sets of lanes left out, each larger -- the named, then to a quarter, then to half
    by crossings -- and never every lane;
-8. route_bus.drc_nets: the nets check_drc's log names in its violations -- both sides of a line between two items
+7. route_bus.drc_nets: the nets check_drc's log names in its violations -- both sides of a line between two items
    (a kind prefix, a pad's ref, a [SHORT], a measurement stripped), a net's own line -- and none from before the
    violations or from the warnings after them: the nets route_bus puts back rather than refuse the whole bus.
 """
@@ -110,21 +107,6 @@ def main():
         names = rb.open_nets(cl)
         if names != {'SA4', 'SCKP', 'SCKN'}:
             fails.append(f'open_nets: {sorted(names)}, want SA4 SCKN SCKP')
-        fb = os.path.join(td, 'feedback.json')
-        json.dump({'pairs': [['a', 'b']], 'avoid': [{'lane': 'SA1', 'end': 1}]}, open(fb, 'w'))
-        new = wr.add_over(fb, {'SCK': 1})
-        if new != ['SCK']:
-            fails.append(f'add_over: first {new}, want [SCK]')
-        if wr.add_over(fb, {'SCK': 1}) != []:
-            fails.append('add_over: the same lane at the same count named again')
-        new = wr.add_over(fb, {'SCK': 2, 'SA4': 1})
-        if new != ['SA4', 'SCK']:
-            fails.append(f'add_over: {new}, want [SA4, SCK] (SA4 new, SCK raised)')
-        j = json.load(open(fb))
-        if j.get('over') != {'SCK': 2, 'SA4': 1} or j.get('pairs') != [['a', 'b']] or len(j.get('avoid', [])) != 1:
-            fails.append(f'add_over: the feedback file reads {j}')
-        if wr.add_over(fb, None) != [] or wr.add_over(fb, {}) != []:
-            fails.append('add_over: a proved plan (no over_nets) named lanes')
         loopd = os.path.join(td, 'loop')
         os.makedirs(loopd)
         if wr.held_plan(loopd, dict(os.environ)) is not None:
@@ -223,7 +205,7 @@ def main():
         print(f'  FAIL: {f}')
     if fails:
         return 1
-    print('PASS: open nets counted and named, over-two lanes fed back, the held plan found, a round that laid '
+    print('PASS: open nets counted and named, the held plan found, a round that laid '
           'nothing named its lanes, the last resort\'s drop sets, the nets a violation names')
     return 0
 

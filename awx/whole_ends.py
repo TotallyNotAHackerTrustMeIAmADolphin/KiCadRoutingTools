@@ -53,6 +53,7 @@ import itertools
 import math
 import os
 import awx_settings
+import cp_seed  # noqa: E402  (every CP-SAT solve under the bus step's seed)
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -111,7 +112,7 @@ def _exact_solve(m):
     from ortools.sat.python import cp_model
     key = hashlib.sha1(str(m.Proto()).encode()).hexdigest()
     if key not in _EXACT_MEMO:
-        sol = cp_model.CpSolver()
+        sol = cp_seed.solver()
         sol.parameters.num_workers = 1
         sol.parameters.max_deterministic_time = EXACT_WORK
         sol.parameters.optimize_with_core = True
@@ -2049,10 +2050,10 @@ def _searched(E, s0, log=print):
 JOINT = (awx_settings.get('ENDS_JOINT') or '1') == '1'
 JOINT_X = 10.0             # a crossing, in vias
 JOINT_LEARN = 20.0         # a crossing in a failing check's core: this many vias more, doubled each time it is again
-JOINT_TRIES = 4            # the joint ends put to the check this many times before the local search takes over
+JOINT_TRIES = 5            # the joint ends put to the check at most this many times; none with a plan, the last
+#                           state stands -- and a round left with nets open is followed by the next seed's (whole_route)
 JOINT_BATCHES = 40         # CP-SAT's interleaved batches, the solve's budget (reproducible)
 JOINT_SEED = awx_settings.get('JOINT_SEED') or ''   # (probe) CP-SAT's random_seed for the joint ends: another trajectory
-JOINT_CHG = 1.0            # a lane whose ends stand on different layers changes layer between them: a via a leg
 START_WORK = 30.0          # the search's start, the nearest state the rules allow: CP-SAT's deterministic seconds, one worker
 
 
@@ -2194,10 +2195,11 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
     its domain (end_domain: a surface end fixed, a via end on the layers its runs clear, its via dropped on its neck's);
     two lanes whose orders round the two pad boxes are STRICTLY opposite (a tie, one exit on two layers, decides nothing:
     TIE_MM) CROSS, and where neither changes layer their ends stand on different layers; two via ends whose runs meet,
-    and two legs stacked at one exit, on different layers. Minimized: the fanout's vias (less those dropped), JOINT_X a
-    crossing and `learned` {frozenset of two lanes: vias} more for those, JOINT_CHG a leg of a lane changing layer, a
-    single's blocked front, the whole route's feedback (FB_AVOID, FB_PAIR) and a walled plane ball (WALLED) as the
-    objective prices them.
+    and two legs stacked at one exit, on different layers; and what the check's refusals taught (joint_choose: E._nogoods,
+    E._nochg, E._nocross). Minimized: a lane changing layer FIRST (a leg each, lexicographic), then the fanout's vias
+    (less those dropped), JOINT_X a crossing and `learned` {frozenset of two lanes: vias} more for those, a single's
+    blocked front, the whole route's feedback (FB_AVOID, FB_PAIR) and a walled plane ball (WALLED) as the objective
+    prices them.
 
     Each rule is written per pair of LANES, not per pair of options -- the model a sixth the size, built and presolved
     in a second where the per-option form took fifteen: a lane's conflicts with another's an at-most-one round each
@@ -2237,7 +2239,24 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
     for k_ in (0, 1):
         for l_ in lanes:
             m.AddExactlyOne(xs[k_][l_].values())
+    # every state the whole solve's check refused (joint_choose), by the LANES its core named: not all of them on the
+    # ends they had there again
+    for ng_ in getattr(E, '_nogoods', ()):
+        lits_ = []
+        for l_, (i_, j_) in sorted(ng_.items()):
+            if l_ not in idx:
+                continue
+            if i_ not in xs[0][l_] or j_ not in xs[1][l_]:
+                lits_ = None
+                break
+            lits_ += [xs[0][l_][i_].Not(), xs[1][l_][j_].Not()]
+        if lits_:
+            m.AddBoolOr(lits_)
     cost = []
+    # a lane's layer chosen at its ends: a leg changing layer between them ranked before everything else the model
+    # prices (lexicographic, below) -- a via at an escape stands in the array's via grid, a change in the channel needs
+    # room beside it there (the human's bus: 51 of 54 nets two escape vias and one layer between)
+    chg_cost = []
     # the conflicts, per pair of lanes
     cpairs = {0: [], 1: []}
     for k_ in (0, 1):
@@ -2283,7 +2302,7 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
                     es.append(e_)
                 m.Add(d_ <= sum(es))
                 cost.append(-Q(1.0) * npair[l_] * d_)
-    # a change where the two ends' layers differ, JOINT_CHG a leg
+    # a change where the two ends' layers differ: a leg each, ranked first (below)
     chg = {}
     for l_ in lanes:
         c_ = m.NewBoolVar('')
@@ -2291,7 +2310,12 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
             m.Add(c_ >= y[0][l_][q] - y[1][l_][q])
             m.Add(c_ + y[0][l_][q] + y[1][l_][q] <= 2)
         chg[l_] = c_
-        cost.append(Q(JOINT_CHG * npair[l_]) * c_)
+        chg_cost.append(npair[l_] * c_)
+    # a lane the whole solve's check found no room for a change in (joint_choose): one layer end to end, on any ends --
+    # its options stand along the same two faces, its route as short on each
+    for l_ in sorted(getattr(E, '_nochg', ())):
+        if l_ in idx:
+            m.Add(chg[l_] == 0)
     # two via ends whose runs meet on different layers (end_clashes' sep), and two legs stacked at one exit (_stacks):
     # per pair of lanes, then different layers
     own_ = lambda k_, l_, i: (lambda L_: E.RL.index(L_) if L_ in E.RL else None)(opts(k_)[l_][i][2])
@@ -2393,6 +2417,8 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
                     continue
                 m.AddBoolOr([xv] + [neg(e_) for e_ in t_ if not isinstance(e_, int)])
             cost.append(w_ * xv)
+            if frozenset((a, b)) in getattr(E, '_nocross', ()):
+                m.Add(xv == 0)                     # (a crossing whose window the check could not hold: not again)
         X[(a, b)] = xv
         for q in range(NL):
             m.Add(y[0][a][q] + y[0][b][q] + xv - chg[a] - chg[b] <= 2)
@@ -2441,6 +2467,17 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
             m.AddBoolOr([alive[b_], wl_] + outs)
             cost.append(Q(WALLED) * wl_)
     m.Minimize(sum(cost) + const)
+    if chg_cost:
+        # (the changes' weight: one more than the most the rest of the objective can take, read off the model itself)
+        pr_ = m.Proto()
+        ob_ = pr_.floating_point_objective if len(pr_.floating_point_objective.vars) else pr_.objective
+        hi_ = 0
+        for v_, c_ in zip(ob_.vars, ob_.coeffs):
+            dm_ = list(pr_.variables[v_ if v_ >= 0 else -v_ - 1].domain)     # (this proto's lists take no index -1)
+            hi_ += abs(c_) * max(abs(dm_[0]), abs(dm_[-1]))
+        W_LEX = int(math.ceil(hi_)) + 1
+        m.Minimize(W_LEX * sum(chg_cost) + sum(cost) + const)
+        log(f'  whole ends: changes ranked first (a leg {W_LEX} against the rest at most {hi_})')
     t1 = time.time()
     # THE START: the descent's ends and the last round's, each moved to the nearest state the rules allow and completed
     sv_val = lambda sv_, mm_, v_: sv_.Value(mm_.GetBoolVarFromProtoIndex(v_.Index()))
@@ -2468,7 +2505,7 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
             for l_ in lanes:
                 for i, v in xs[k_][l_].items():
                     r1.AddHint(r1.GetBoolVarFromProtoIndex(v.Index()), int(i == s0[l_][k_]))
-        s1_ = cp_model.CpSolver()
+        s1_ = cp_seed.solver()
         s1_.parameters.num_workers = 1
         s1_.parameters.max_deterministic_time = START_WORK
         q1 = s1_.Solve(r1)
@@ -2481,7 +2518,7 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
             for l_ in lanes:
                 for i, v in xs[k_][l_].items():
                     r2.Add(r2.GetBoolVarFromProtoIndex(v.Index()) == int(i == ends_[(k_, l_)]))
-        s2_ = cp_model.CpSolver()
+        s2_ = cp_seed.solver()
         s2_.parameters.num_workers = 1
         s2_.parameters.max_deterministic_time = 30.0
         q2 = s2_.Solve(r2)
@@ -2498,7 +2535,7 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
             m.AddHint(m.GetIntVarFromProtoIndex(i_), v_)
         why.append(f'started from {best[2]}')
     t2 = time.time()
-    sv = cp_model.CpSolver()
+    sv = cp_seed.solver()
     # (REPRODUCIBLE, as whole_solve's: stopped by a count of interleaved batches, the workers sharing no clauses)
     sv.parameters.num_workers = whole_solve.SOLVE_WORKERS
     sv.parameters.subsolvers.extend(whole_solve.FALLBACK)
@@ -2521,9 +2558,12 @@ def joint_state(E, hint, learned=None, log=print, boxes=None):
 
 def joint_choose(st, log=print, fixed=None, seed=None, learned=None, free_teeth=None):
     """choose's answer from THE JOINT ENDS (joint_state) -- on an escape base, at the far face's cut the greedy start's
-    berths leave, each state put to the whole solve's strict check (solve_check) and a failing one's core priced
-    (JOINT_LEARN, doubled when named again) up to JOINT_TRIES times; None where none has a plan (the local search then
-    takes over, with its repair)"""
+    berths leave, each state put to the whole solve's strict check (solve_check, exact: the LANES its core names) up to
+    JOINT_TRIES times, a refused one teaching every later state (not those lanes on those ends again, a lane with no
+    room for a change on one layer, a crossing whose window could not hold not again) and its core's crossings priced
+    (JOINT_LEARN, doubled when named again). None with a plan: the last state stands -- the round lays it, and a round
+    left with nets open is followed by round 1 again under the next seed (whole_route). None only where the model has
+    no state at all (the local search then takes over)"""
     import whole_frame
     t0 = time.time()
     E = Ends(st, src_free=True, fixed=fixed, learned=learned, free_teeth=free_teeth)
@@ -2559,29 +2599,51 @@ def joint_choose(st, log=print, fixed=None, seed=None, learned=None, free_teeth=
     xl = {}
     check_on = (awx_settings.get('ENDS_SOLVE_CHECK') or '1') == '1'
     t_chk = []
+    # what each refused state teaches, held for every later state (joint_state): the LANES its exact core names not
+    # all on those ends again, a lane with no room for a change on its ends on one layer, and two lanes whose crossing's
+    # window the check could not hold not crossing
+    E._nogoods, E._nochg, E._nocross = [], set(), set()
+    last_ = None
     for k in range(JOINT_TRIES):
         s, how = joint_state(E, hint, xl, log=log, boxes=boxes)
         if s is None:
+            if last_ is not None:
+                log(f'  whole ends: the joint ends: no state ({how}) -- the last one stands')
+                s, how = last_
+                break
             log(f'  whole ends: the joint ends: no state ({how}) -- the local search')
             return None
+        last_ = (s, how)
         t_k = time.time()
-        chk = solve_check(E, s) if check_on else None
+        chk = solve_check(E, s, exact=True) if check_on else None
         t_chk.append(time.time() - t_k)
         if chk is None or chk.get('plan'):
             break
         log(f'  whole ends: the joint ends ({how}): the solve\'s check: NO plan [{chk.get("status")}], core '
-            f'{chk.get("core")}' + (f', rules {chk.get("rules")}' if chk.get('rules') else '')
-            + (f', crowded {chk.get("crowded")}' if chk.get('crowded') else ''))
-        if not chk.get('core'):
-            log('  whole ends: the joint ends: nothing to learn -- the local search')
-            return None
-        for a, b in chk['core']:
+            f'{chk.get("core")}' + (f', lanes {chk.get("lanes")}' if chk.get('lanes') else '') + f' ({t_chk[-1]:.1f} s)')
+        if chk.get('lanes'):
+            n0_ = len(E._nochg)
+            E._nochg |= {l_ for l_ in chk.get('nochange') or () if l_ in s}
+            if len(E._nochg) > n0_:
+                log(f'  whole ends: the joint ends: {len(E._nochg) - n0_} lane(s) with no room for a change on their '
+                    f'ends, held to one layer: ' + ', '.join(sorted(chk.get('nochange') or ())))
+            if chk.get('core'):
+                E._nocross |= {frozenset(k_) for k_ in chk['core']}
+                log(f'  whole ends: the joint ends: crossings held apart: '
+                    + ', '.join('/'.join(sorted(k_)) for k_ in sorted(E._nocross, key=sorted)))
+            E._nogoods.append({l_: tuple(s[l_]) for l_ in chk['lanes'] if l_ in s})
+            log(f'  whole ends: the joint ends: {len(E._nogoods)} refused state(s) held -- {len(chk["lanes"])} lane(s) '
+                f'this time')
+        elif not chk.get('core'):
+            log('  whole ends: the joint ends: nothing to learn -- this state stands')
+            break
+        for a, b in chk.get('core') or ():
             k_ = frozenset((a, b))
             xl[k_] = 2 * xl[k_] if k_ in xl else JOINT_LEARN
         hint = joint_descent(E, s, boxes, E.wcut, xl)[0]      # (the next solve's hint: descended with the core priced)
     else:
-        log(f'  whole ends: the joint ends: no plan in {JOINT_TRIES} checks -- the local search')
-        return None
+        log(f'  whole ends: the joint ends: no plan in {JOINT_TRIES} checks -- the last state stands')
+        s, how = last_
     E._memo.clear(); E._parts.clear()
     t_f = time.time()
     v, p = E.score(s, exact=True)
@@ -2676,8 +2738,12 @@ def choose(st, log=print, src_free=True, fixed=None, seed=None, learned=None, fr
     # that board's teeth as laid, and fanout_from_plan need not ask again; `cut` the cut the ends taken were chosen at:
     # the teeth's search's where its ends are taken, else the first's -- on a board with no tooth laid every tooth is a
     # move either way, and the moves alone named the second search's cut beside the first search's ends)
+    # (a far-face choice -- no winding cut taken -- carries the far face's cut its state was scored at, a tied gap's
+    # where it scores best (_score); without it the frame cut the far face at its widest gap: 307 crossings for the
+    # model's 69, and no plan)
+    cut_ = E2.wcut if E2 is not None and vF < vL - TOOTH_GAIN else E.wcut
     choose.last = dict(laid=vL, laid_parts=pL, free=vF, free_parts=pF, moved=bool(out[1]), st=id(st),
-                       cut=(E2.wcut if E2 is not None and vF < vL - TOOTH_GAIN else E.wcut), parts=parts_)
+                       cut=cut_ if cut_ is not None else (parts_ or {}).get('cut'), parts=parts_)
     return out
 
 
@@ -2838,12 +2904,18 @@ def checked(E, state, parts, log=print):
                 E.x_learned[key] = 2.0 * E.x_learned[key] if key in E.x_learned else X_LEARN
             for l_ in sorted({l_ for l_, f_ in v['rules'] if f_ == 'hands'}):
                 E.opp_learned[l_] = 2.0 * E.opp_learned[l_] if l_ in E.opp_learned else X_LEARN
+        learned_ = bool(v['core'] or v.get('rules'))
         E._memo.clear(); E._parts.clear(); E.pool.clear()
         nxt, (_vn, pn) = E.best_exact(E.search(cur, log=quiet), log=quiet)
-        v = solve_check(E, nxt, front=pn.get('lane_front'))
+        v_was, v = v, solve_check(E, nxt, front=pn.get('lane_front'))
         say(f'searched again, {len(E.x_learned)} crossing(s) priced ({k + 1}): {_fmt(pn)}', v)
         if v and v['plan']:
             return nxt
+        if nxt == cur and not learned_ and v == v_was:
+            # (nothing learned, and the search again came back to the same state with the same verdict: the next try
+            # would be this one again -- the sweep, the search, its exact routes and the check all deterministic. An
+            # escape bus's second round once made four such tries, 260 s each: crowded lanes and no core)
+            break
         cur = nxt
     if not v['plan']:
         log('  whole ends: no searched state has a plan under the solve\'s strict rules -- the ends stand as chosen')
@@ -2879,15 +2951,20 @@ def state_plan(E, state):
                 for p, q, L in m.legs:
                     if L == m.layer and math.hypot(q[0] - p[0], q[1] - p[1]) > 1e-6:
                         tracks.append({'start': tuple(p), 'end': tuple(q), 'width': fan, 'layer': L, 'net_id': nid})
-    if E.wcut is not None:
-        plan['dest_cut'] = list(E.wcut) if isinstance(E.wcut, (list, tuple)) else E.wcut
-    scut = E.score(state)[1].get('scut')
+    sp_ = E.score(state)[1]
+    # (the destination's cut the state was SCORED at: winding's, else the far face's tied cut it scores best at
+    # (_score) -- not the far face's widest gap, which the frame takes where the sidecar carries no cut: the two split
+    # the far face differently, and the check faced crossings the model never priced, 69 against 307)
+    dc_ = E.wcut if E.wcut is not None else sp_.get('cut')
+    if dc_ is not None:
+        plan['dest_cut'] = list(dc_) if isinstance(dc_, (list, tuple)) else dc_
+    scut = sp_.get('scut')
     if scut is not None:
         plan['src_cut'] = float(scut)       # (the source's far face's cut, as the model read the state)
     return plan, tracks, [nm for nm in st['launch'] if nm in plan['ends']]
 
 
-def solve_check(E, state, front=None, crowd=True):
+def solve_check(E, state, front=None, crowd=True, exact=False):
     """THE WHOLE SOLVE'S OWN VERDICT on an ESCAPE state's ends, before any is laid: the bench the state makes
     (whole_ctx.candidate: the board as it stands, each end's escape run added in memory, the plan sidecar's keys from
     the state at the ends model's cut) given to whole_solve.solve under its strict rules (no relaxation) -- the same
@@ -2896,7 +2973,10 @@ def solve_check(E, state, front=None, crowd=True):
     plan in 21 of 29 rounds where that route found one: lanes leaving the source's near face enter the trunk a millimetre
     or two before the rings leave it, and a pair's end rooms leave no place there for the change its crossings force.
     {'plan': bool, 'crowded': [lanes the CROWD diagnosis names when there is none]}; None when it cannot be asked (not
-    an escape state, a plan in the turned-over pair frame)"""
+    an escape state, a plan in the turned-over pair frame). `exact` (the joint loop's): with no plan, the LANES whose
+    rules cannot hold together (a second solve, every rule of a lane on one assumption, the core made minimal) and the
+    lanes of the crossings whose windows either solve's core named, and 'nochange' -- the lanes no change fits in on
+    these ends -- in place of the rules and crowd diagnoses"""
     st = E.st
     if not st.get('escape'):
         return None
@@ -2911,9 +2991,24 @@ def solve_check(E, state, front=None, crowd=True):
         return None
     rules_ = (awx_settings.get('ENDS_CHECK_RULES') or '0') == '1'
     with contextlib.redirect_stdout(io.StringIO()):
-        J = whole_solve.solve(ctx, st['dref'], front=front or {}, check=True, core=crowd)
+        J = whole_solve.solve(ctx, st['dref'], front=front or {}, check=True, core=crowd or exact)
         out = {'plan': bool(J and J.get('plan')), 'status': (J or {}).get('status'), 'crowded': [],
                'core': [tuple(k_) for k_ in (J or {}).get('core') or []], 'rules': []}
+        if exact:
+            out['lanes'] = []
+            out['nochange'] = list((J or {}).get('nochange') or [])
+            if not out['plan'] and out['status'] == 'INFEASIBLE':
+                Jl = whole_solve.solve(ctx, st['dref'], front=front or {}, check=True, core=True, rules=True,
+                                       lanecore=True)
+                # (the lanes solve's own crossing windows too: where the first check's core is empty -- its presolve
+                # proved the model infeasible with no assumption in the proof -- the crossings it names are the only
+                # reason to learn; left out, a refused state taught nothing and the loop stopped)
+                jc_ = [tuple(k_) for k_ in (Jl or {}).get('core') or []]
+                if not out['core']:
+                    out['core'] = jc_
+                out['lanes'] = sorted({r_[0] for r_ in (Jl or {}).get('rules') or []}
+                                      | {l_ for k_ in out['core'] + jc_ for l_ in k_})
+            return out
         if rules_ and crowd and not out['plan'] and not out['core'] and out['status'] == 'INFEASIBLE':
             # (the RULES core only where the windows' names nothing: it costs a solve per rule to make minimal, and
             # a core of crossings the repair already prices -- zynq LVDS K47, 15 crossings: a plan at its first

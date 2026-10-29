@@ -48,6 +48,7 @@ import time
 import types
 
 import awx_settings
+import cp_seed  # noqa: E402  (every CP-SAT solve under the bus step's seed)
 from coherent_nets import namer, engine_filter      # (a net by the whole route's name: its last part, else in full)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -747,7 +748,7 @@ def colour_runs(runs, edges, together, want):
     rank = lambda k, L: 0 if L == want.get(k) else 1 + sorted(runs[k], key=lambda L_: (
         L_ not in ('F.Cu', 'B.Cu'), runs[k].index(L_))).index(L)
     mdl.Maximize(sum(1000 * ok[k] for k in runs) - sum(rank(k, L) * x for k in runs for L, x in c[k].items()))
-    s = cp_model.CpSolver()
+    s = cp_seed.solver()
     s.parameters.num_workers = 1
     s.parameters.max_deterministic_time = 30
     st = s.Solve(mdl)
@@ -1721,7 +1722,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
         `executor`) -- their answer kept by its key (_SOLVED)"""
         t_p1 = time.time()
         let_go = []
-        s1 = cp_model.CpSolver()
+        s1 = cp_seed.solver()
         s1.parameters.num_workers = 1
         s1.parameters.max_deterministic_time = P1_DET
         # (no LP: the question is a yes or no over booleans -- each ball one option, conflicting options never together --
@@ -1797,7 +1798,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
             for key in keys:
                 for var in v[key]:
                     mdl.AddHint(var, val(var))
-            sw = cp_model.CpSolver()
+            sw = cp_seed.solver()
             sw.parameters.num_workers = 1
             sw.parameters.fix_variables_to_their_hinted_value = True
             sw.parameters.stop_after_first_solution = True
@@ -1816,7 +1817,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
                     mdl.AddHint(v[key][i0], 1)
                 mdl.ClearObjective()
                 mdl.Maximize(sum(v[key][i0] for key, i0 in start.items()))
-                sa = cp_model.CpSolver()
+                sa = cp_seed.solver()
                 sa.parameters.num_workers = 1
                 sa.parameters.cp_model_presolve = False
                 sa.parameters.stop_after_first_solution = True
@@ -1836,7 +1837,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
                     for var in v[key]:
                         mdl.AddHint(var, hint_vals[var.Index()])
         started = sw is not None
-        s_ = cp_model.CpSolver()
+        s_ = cp_seed.solver()
         # REPRODUCIBLE, as the whole solve is (whole_solve): stopped by a count of interleaved batches, the workers
         # sharing no clauses -- the same model gives the same answer (a wall-clock limit on eight workers gave two answers
         # in two runs of zynq U1's array). `time_limit` caps the wall clock on top, and an answer it stops is not
