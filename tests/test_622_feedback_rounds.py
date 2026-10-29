@@ -38,6 +38,7 @@ CONN = """  Connectivity issues (1):
     Disconnected pads:
       (20.10, 1.00) on B.Cu [U2]
 """
+BOARD = '(kicad_pcb (version 20240108) (generator "test")\n  (net 0 "")\n  (net 4 "N1")\n  (net 5 "N2")\n)\n'
 
 
 def fb_run(td, args, **env):
@@ -65,6 +66,7 @@ def main():
         json.dump(SIDECAR, open(sc, 'w'))
         json.dump(HOT, open(hot, 'w'))
         open(conn, 'w').write(CONN)
+        open(os.path.join(td, 'fo.kicad_pcb'), 'w').write(BOARD)      # (--name keys the log's nets by the board's)
 
         # 1. raised a later round, once
         line, fb = fb_run(td, [sc, out, hot], FB_ROUND='1')
