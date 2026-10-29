@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""whole_route.py K OUTDIR [ROUNDS] -- the whole route on rung K, end to end, in Python.
+"""whole_route.py K OUTDIR [ROUNDS] [--feedback-rounds F] -- the whole route on rung K, end to end, in Python.
    whole_route.py --loop SOLVE.json OUTDIR [ROUNDS] -- the loop alone on a solve (the bench from BENCH / NETS / DEST).
 
 The same chain as whole_chain.sh and whole_loop.sh, and the same stages run the same way: each stage is its own
@@ -11,8 +11,11 @@ The chain (whole_chain.sh): the fanout choosing every net's tooth and berth with
 graded (check_connected, check_drc). A round that leaves nets open is followed by round 1 AGAIN under the next seed
 (cp_seed: every solve of the round searches under the step's seed plus the round less one) -- from the same board, the
 cap step again, nothing carried from the round before: another draw, not a repair of this one -- up to ROUNDS rounds
-(default 3), the first laid clean ending them. BASE (default fb_t2q_pairs.kicad_pcb) is the bench, DEST (default DU1)
-its destination part, both from the environment as the shell script reads them.
+(default 2), the first laid clean ending them. With --feedback-rounds F (default 0), up to F of them after each draw
+are FEEDBACK ROUNDS under its seed instead: the ends the round before's audits found crowded, its lanes over two vias
+and its open nets (whole_feedback) go back to the fanout (FEEDBACK=), which chooses again INCREMENTALLY from that
+round's board. BASE (default fb_t2q_pairs.kicad_pcb) is the bench, DEST (default DU1) its destination part, both from
+the environment as the shell script reads them.
 
 The loop (whole_loop.sh), every step fed by a MEASUREMENT of the one before: geometry (whole_geo), polish
 (whole_polish), audit (whole_audit through whole_gate); side flips the polish could not avoid go to the geometry again
@@ -81,6 +84,7 @@ class Log:
             self.f.flush()
 
 
+FANOUT_RAISES = 3   # a feedback round's fanout laying the round before's ends again: its findings raised, the fanout again
 INPROC = False      # --inproc: every stage in this process, as a routing call inside KiCad's own process will run them
 
 
@@ -1334,6 +1338,20 @@ def partial_drops(named, xs, lanes):
     return drops
 
 
+def add_over(fb_path, over_nets):
+    """the lanes an UNPROVED plan leaves over two vias (whole_solve 'over_nets'), merged into a feedback round's findings
+    (FEEDBACK=, whole_ends 'over': each counted over by at least that much); the lanes it newly names"""
+    if not over_nets:
+        return []
+    fb = json.load(open(fb_path)) if os.path.isfile(fb_path) else {'pairs': [], 'avoid': []}
+    ov = fb.setdefault('over', {})
+    new = [n for n, k in sorted(over_nets.items()) if int(k) > int(ov.get(n, 0))]
+    for n in new:
+        ov[n] = int(over_nets[n])
+    json.dump(fb, open(fb_path, 'w'), indent=1)
+    return new
+
+
 def stage_env(env):
     """the settings every stage of the chain runs under, set in `env` (and returned): one thread per numeric library,
     the harness's caches, and the plan environment of the fanout on our own ends (resolve_round.py runs one stage
@@ -1411,10 +1429,11 @@ def place_held(board, out, held):
     return out
 
 
-def chain(K, o, R=3, base=None, dest=None, settings=None):
+def chain(K, o, R=2, base=None, dest=None, settings=None, F=0):
     """whole_chain.sh K OUTDIR ROUNDS: the exit code, the grade the last line printed. The bench and its destination
     are `base` and `dest` when given (route_bus.py), else BASE and DEST from the environment; `settings` go over the
-    environment for every stage (route_bus.py's caches off)"""
+    environment for every stage (route_bus.py's caches off). `R` rounds at most, of them up to `F` feedback rounds
+    after each draw (below)"""
     o = os.path.abspath(o)
     os.makedirs(o, exist_ok=True)
     t0 = time.time()
@@ -1442,12 +1461,22 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
         os.remove(HELD)
     say = Log()
     r = 0
-    # THE ROUNDS ARE DRAWS: round r searches under the step's seed plus r - 1 (cp_seed: every solve -- the fanout's
-    # joint ends and escape plans, the round's solve, the loop's re-solves) from the same board, the cap step again and
-    # nothing carried from the round before; the first round laid clean ends them, else the best one laid is kept. A
-    # round that left nets open was rarely the start of a better one (rounds fed back what it found cleaned 1 of 9 such
-    # rounds and made 4 worse), where another draw of the same board laid clean in 5 of 12 tries
+    # THE ROUNDS ARE DRAWS: the d-th draw searches under the step's seed plus d - 1 (cp_seed: every solve -- the
+    # fanout's joint ends and escape plans, the round's solve, the loop's re-solves) from the same board, the cap step
+    # again and nothing carried from the round before; the first round laid clean ends them, else the best one laid is
+    # kept. A round that left nets open was rarely the start of a better one (rounds fed back what it found cleaned 1 of
+    # 9 such rounds and made 4 worse), where another draw of the same board laid clean in 5 of 12 tries.
+    # Up to F FEEDBACK ROUNDS (route_bus --feedback-rounds, default none) follow each draw that leaves nets open, under
+    # its seed: what the round before found -- the ends its audits found crowded, the lanes its solve could not keep to
+    # two vias, its open nets (whole_feedback) -- goes back to the fanout (FEEDBACK=, its own file), which chooses again
+    # INCREMENTALLY from that round's board, the passives where the draw's cap step left them. A feedback round that has
+    # nothing new to say is the next draw instead
     seed0 = int(env.get('BUS_SEED') or cp_seed.DEFAULT)
+    base0 = base
+    FBD = os.path.join(o, 'findings.json')
+    if os.path.exists(FBD):
+        os.remove(FBD)
+    draw, fed_left, prev = 0, 0, ''
     # the best result of the rounds so far, by its open nets, then its vias (and a result with a violation after every
     # clean one): the chain never ends with nothing when a round had a plan to lay
     best = None
@@ -1460,6 +1489,20 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
     from coherent_nets import net_keys
     with contextlib.redirect_stdout(io.StringIO()):
         keys_ = net_keys(parse_kicad_pcb(base if os.path.isabs(base) else os.path.join(HERE, base)))
+
+    def advance(d, base):
+        """a feedback round's base: the round before's realized source board (its fo.log names it), else `base` as it
+        was -- the passives where the draw's cap step left them (HELD); the source board is written before it moves
+        them, and a base without them had every round move them again, from where they stood, not always the same"""
+        was = base
+        sb = source_board_named(os.path.join(d, 'fo.log'))
+        if sb and os.path.isfile(os.path.join(d, sb)):
+            base = os.path.join(d, sb)
+        if os.path.isfile(HELD):
+            base = place_held(base, os.path.join(d, 'base_held.kicad_pcb'), json.load(open(HELD)))
+        if base != was and 'BASE' in env:
+            env['BASE'] = base
+        return base
 
     def lay(r, d, plan, bench, nets=None, tag='', quiet=False):
         """route_lanes all at once on PLAN, graded: the result (its key, open nets, violation, grade line, board), or
@@ -1584,13 +1627,31 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, 'nets.lines'), 'w') as f:
             f.write(NETS.replace(',', '\n') + '\n')
-        if r > 1:
-            env['BUS_SEED'] = str(seed0 + r - 1)
-        say(f"=== fanout round {r}" + (f": round 1 again under seed {seed0 + r - 1}" if r > 1 else ''))
+        # (`fed`: the round this one follows with its findings -- a feedback round -- else '' and a draw)
+        fed, prev = prev, ''
+        if fed:
+            say(f"=== fanout round {r}: round {r - 1}'s findings, under the same seed")
+        else:
+            draw += 1
+            fed_left = F
+            base = base0
+            if 'BASE' in env:
+                env['BASE'] = base0
+            if os.path.exists(FBD):
+                os.remove(FBD)
+            if draw > 1:
+                env['BUS_SEED'] = str(seed0 + draw - 1)
+            say(f"=== fanout round {r}" + (f": round 1 again under seed {seed0 + draw - 1}" if r > 1 else ''))
         fenv = dict(env)
         # (the run's nets, every round: a fanout never re-picks them off a later round's board -- K51's second round,
         # re-picked, dropped its three pairs while their teeth stood on the board, and the solve found them split)
         fenv['FANOUT_NETS'] = NETS
+        if fed:
+            if os.path.isfile(HELD):
+                fenv['FANOUT_PASSIVES_FIXED'] = '1'         # (joint_escape.passives_fixed: the cap step has moved them)
+            if os.path.isfile(FBD):
+                fenv['FEEDBACK'] = FBD
+            fenv['INCREMENTAL'] = os.path.join(fed, 'fo.plan.json')
         rc = run(['fanout_from_plan.py', os.path.join(d, 'fo.kicad_pcb'), str(K), f'--board={base}'], fenv,
                  log_path=os.path.join(d, 'fo.log'))[0]
         say(f"  fanout exit {rc} at {secs()} s")
@@ -1598,19 +1659,67 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
             say(ln[:220])
         if not os.path.isfile(os.path.join(d, 'fo.kicad_pcb')):
             # a board the FANOUT AUDIT refused (fanout_from_plan: a pair split by other lanes' ends) is a draw that
-            # failed: what it named recorded (the last resort leaves those lanes out), and the next seed's round
+            # failed: what it named recorded (the last resort leaves those lanes out), and the next seed's round -- or,
+            # a feedback round left, that round: the split pairs and the lanes between their tips, ends not to be
+            # chosen together again, freed incrementally, while the refusal names something new
             refused = os.path.join(d, 'fo.refused.json')
             if os.path.isfile(refused) and os.path.isfile(os.path.join(d, 'fo.plan.json')):
                 for ln in grep(os.path.join(d, 'fo.log'), r'^REFUSED'):
                     say('  ' + ln[:220])
                 say(stripped(run(['whole_feedback.py', '--refused', os.path.join(d, 'fo.plan.json'), FB, refused],
                                  {**env, 'FB_ROUND': str(r)}, err=sys.stderr)[1]))
+                if fed_left and r < R:
+                    fbl = stripped(run(['whole_feedback.py', '--refused', os.path.join(d, 'fo.plan.json'), FBD,
+                                        refused], {**env, 'FB_ROUND': str(r)}, err=sys.stderr)[1])
+                    if re.search(r'whole_feedback: [1-9]', fbl):
+                        say("=== the fanout refused its board -- a feedback round frees the ends it named")
+                        base = advance(d, base)
+                        prev, fed_left = d, fed_left - 1
+                        continue
+                    say("  the refusal names nothing new for a feedback round")
                 say("=== the fanout refused its board -- the next seed's round")
                 continue
             say("  no fanout board -- the rounds end here")
             break
+
+        # a feedback round's fanout laying the round before's ends again (findings it priced but did not follow): the
+        # rest of the round would be the same -- so the findings named in that round are raised (whole_feedback --raise:
+        # their ends' prices doubled; the second time, the other ends of the lanes named too) and the fanout ALONE runs
+        # again, up to FANOUT_RAISES times; one that still lays the same ends is the next draw
+        def same_ends():
+            try:
+                return json.load(open(os.path.join(d, 'fo.plan.json'))) == \
+                    json.load(open(os.path.join(fed, 'fo.plan.json')))
+            except Exception:
+                return False
+        if fed and same_ends():
+            say(f"=== fanout round {r} laid round {r - 1}'s ends again")
+            for k_ in range(1, FANOUT_RAISES + 1):
+                fbr = stripped(run(['whole_feedback.py', '--raise', os.path.join(fed, 'fo.plan.json'), FBD]
+                                   + (['--widen'] if k_ == 2 else []), {**env, 'FB_ROUND': str(r - 1)},
+                                   err=sys.stderr)[1])
+                say('  ' + fbr)
+                if not re.search(r'whole_feedback: [1-9]', fbr):
+                    break
+                os.replace(os.path.join(d, 'fo.log'), os.path.join(d, f'fo.same{k_}.log'))
+                rc = run(['fanout_from_plan.py', os.path.join(d, 'fo.kicad_pcb'), str(K), f'--board={base}'], fenv,
+                         log_path=os.path.join(d, 'fo.log'))[0]
+                say(f"  fanout again, the findings raised: exit {rc} at {secs()} s")
+                for ln in grep(os.path.join(d, 'fo.log'), r'plan model'):
+                    say(ln[:220])
+                if not os.path.isfile(os.path.join(d, 'fo.kicad_pcb')) or not same_ends():
+                    break
+            if not os.path.isfile(os.path.join(d, 'fo.kicad_pcb')):
+                say("  no fanout board -- the next seed's round")
+                continue
+            if same_ends():
+                say(f"=== fanout round {r} laid round {r - 1}'s ends again, the findings raised -- the next seed's "
+                    f"round")
+                continue
         bench = os.path.join(d, 'fo.kicad_pcb')
-        if env.get('FANOUT_JOINT'):
+        if env.get('FANOUT_JOINT') and fed and os.path.isfile(HELD):
+            say('  caps: held where the draw\'s cap step left them -- the fanout went round them')
+        elif env.get('FANOUT_JOINT'):
             # the parts the joint fanout lays through -- the movable passives under the arrays, as the chain's own
             # fanout does -- move off its copper now, ONCE, as the chain's cap nudge moves them after its fanout
             # (place_fanout_clearance), and the route holds them fixed where they are left: routed round them where
@@ -1727,6 +1836,43 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
             say(stripped(run(['whole_feedback.py', '--name', os.path.join(d, 'fo.plan.json'), FB]
                              + (res['open_nets'] if res else crowded),
                              {**env, 'FB_ROUND': str(r), 'FB_CONN': os.path.join(d, 'conn.log')}, err=sys.stderr)[1]))
+        if fed_left and r < R:
+            # ---- a FEEDBACK ROUND next: its findings -- the ends the audits found crowded (a loop that did not pass),
+            # and the lanes an unproved plan left over two vias, which the ends counted on keeping at two
+            hots = []
+            if rc is not None and rc != 0:
+                for a in sorted(glob.glob(os.path.join(loopd, 'p*.audit'))) + \
+                        sorted(glob.glob(os.path.join(loopd, 'q*.audit'))):
+                    j, h = a[:-len('.audit')] + '.json', a[:-len('.audit')] + '.fbhot.json'
+                    run(['whole_gate.py', j, a, '--hot', h], env)
+                    hots.append(h)
+                hots += sorted(glob.glob(os.path.join(loopd, 'hs*.json')))     # the snapped plans' places
+            new_over = add_over(FBD, J.get('over_nets') if J and not proved else None)
+            # (the round, so an end named again in a later one is raised, not added: whole_feedback)
+            fbl = stripped(run(['whole_feedback.py', os.path.join(d, 'fo.plan.json'), FBD] + hots,
+                               {**env, 'FB_ROUND': str(r)}, err=sys.stderr)[1])
+            say(fbl)
+            if new_over:
+                say(f"  the ends to count {', '.join(new_over)} over two vias: the solve could not keep them at two")
+            nothing = 'whole_feedback: 0 new' in fbl and not new_over
+            if (res is not None and res['open']) or (nothing and res is None):
+                # a round that leaves nets OPEN names them to the fanout, whatever its audits found -- and one that
+                # lays NOTHING with nothing new from its audits names the lanes the ends model names on these ends (its
+                # nets over two, else its lanes loaded on the trunk, else its most crossed): their ends freed and to
+                # be avoided -- an open net's at the end where its trouble is, by the round's findings and its
+                # connectivity. A round with no plan names the lanes its solve's CROWD diagnosis found no room for
+                fbn = stripped(run(['whole_feedback.py', '--name', os.path.join(d, 'fo.plan.json'), FBD]
+                                   + (res['open_nets'] if res else crowded),
+                                   {**env, 'FB_ROUND': str(r), 'FB_HOTS': ','.join(hots),
+                                    'FB_CONN': os.path.join(d, 'conn.log')}, err=sys.stderr)[1])
+                say(fbn)
+                nothing = nothing and not re.search(r'whole_feedback: [1-9]', fbn)
+            if not nothing:
+                base = advance(d, base)
+                prev, fed_left = d, fed_left - 1
+                say(f"=== round {r} left nets open -- a feedback round, under the same seed")
+                continue
+            say("  the findings add nothing new: a feedback round would lay the same ends")
         if r < R:
             say(f"=== round {r} left nets open -- round 1 again under the next seed")
     if best is None:
@@ -1777,7 +1923,10 @@ def main():
     ap.add_argument('first', metavar='K|SOLVE', help="the rung on the bench's ladder, or with --loop the solve JSON")
     ap.add_argument('outdir', metavar='OUTDIR')
     ap.add_argument('rounds', metavar='ROUNDS', nargs='?', type=int,
-                    help="the fanout rounds (default 3), or with --loop the loop's rounds (default 6)")
+                    help="the fanout rounds (default 2), or with --loop the loop's rounds (default 6)")
+    ap.add_argument('--feedback-rounds', type=int, default=0, metavar='F',
+                    help="after each draw that leaves nets open, up to F rounds under its seed fed its findings "
+                         "(default 0: every round a draw)")
     ap.add_argument('--loop', action='store_true',
                     help='the loop alone on a solve, the bench from BENCH / NETS / DEST as every whole_* stage reads it')
     ap.add_argument('--inproc', action='store_true',
@@ -1796,7 +1945,7 @@ def main():
     INPROC = a.inproc
     if a.loop:
         sys.exit(loop(a.first, os.path.abspath(a.outdir), a.rounds or 6, dict(os.environ), Log()))
-    sys.exit(chain(a.first, a.outdir, a.rounds or 3)[0])
+    sys.exit(chain(a.first, a.outdir, a.rounds or 2, F=a.feedback_rounds)[0])
 
 
 if __name__ == '__main__':

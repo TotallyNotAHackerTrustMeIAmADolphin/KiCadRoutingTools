@@ -2,6 +2,7 @@
 """route_bus.py -- the bus step: an array pair's bus routed on the board as it is.
 
     python3 route_bus.py BOARD.kicad_pcb OUT.kicad_pcb [--src U1 --dest U2] [--k K] [--rounds R] [--inproc]
+                         [--feedback-rounds F]
                          [--clearance C] [--track-width W] [--fanout-track-width W] [--via-size D] [--via-drill D]
                          [--json-out FILE]
     python3 route_bus.py BOARD.kicad_pcb OUT.kicad_pcb --bus SRC:DEST[:MODE[:LAYERS]] [--bus ...] [...]
@@ -146,8 +147,8 @@ def resolve_rules(board, clearance=None, clearance_ceiling=None, track_width=Non
     return dataclasses.replace(r, source='the chain\'s sizes, resolved as route.py resolves its own')
 
 
-def route_bus(board, out, src, dest, k=None, rounds=3, inproc=False, log=print, json_out=None, joint_fanout=False,
-              escape=False, settings=None, **sizes):
+def route_bus(board, out, src, dest, k=None, rounds=2, inproc=False, log=print, json_out=None, joint_fanout=False,
+              escape=False, settings=None, feedback_rounds=0, **sizes):
     """Route the bus between `src` and `dest` on `board`, writing `out`, at the chain's sizes (`sizes`: SIZE_ARGS,
     resolve_rules). Returns (exit code, grade line). The run's rules are installed for the step and supplied to
     every stage (rules.SETTING); the process's own are put back after. `settings` {name: value}: awx settings for
@@ -162,7 +163,7 @@ def route_bus(board, out, src, dest, k=None, rounds=3, inproc=False, log=print, 
     try:
         with step_policy(run_rules, settings):
             return _route(board, out, src, dest, k, rounds, inproc, log, run_rules, json_out, joint_fanout, escape,
-                          settings)
+                          settings, feedback_rounds)
     finally:
         _rules.install(prev)
 
@@ -184,8 +185,8 @@ def parse_bus(spec):
     return parts[0], parts[1], mode, layers
 
 
-def route_buses(board, out, buses=None, k=None, rounds=3, inproc=False, log=print, json_out=None,
-                joint_fanout=False, escape=False, **sizes):
+def route_buses(board, out, buses=None, k=None, rounds=2, inproc=False, log=print, json_out=None,
+                joint_fanout=False, escape=False, feedback_rounds=0, **sizes):
     """Every bus on `board` routed in turn, each on the board the one before handed on, `out` the last: `buses` as
     [(src, dest)] or [(src, dest, mode, layers)] (parse_bus: MODE joint, escape or plain, None for `joint_fanout` /
     `escape`; LAYERS the bus's ROUTE_LAYERS, None for the environment's), else the ones find_buses takes, the largest
@@ -231,7 +232,8 @@ def route_buses(board, out, buses=None, k=None, rounds=3, inproc=False, log=prin
         step_json = os.path.join(work, f'{s}-{d}.summary.json')
         inputs.append(cur)
         code, g = route_bus(cur, step_out, s, d, k, rounds, inproc, log, json_out=step_json,
-                            joint_fanout=mode == 'joint', escape=mode == 'escape', settings=settings or None, **sizes)
+                            joint_fanout=mode == 'joint', escape=mode == 'escape', settings=settings or None,
+                            feedback_rounds=feedback_rounds, **sizes)
         runs.append(dict(src=s, dest=d, mode=mode, settings=settings, exit=code, grade=g, summary=step_json))
         if code == 0:
             for r_ in parts_:
@@ -249,7 +251,7 @@ def route_buses(board, out, buses=None, k=None, rounds=3, inproc=False, log=prin
 
 
 def _route(board, out, src, dest, k, rounds, inproc, log, run_rules, json_out=None, joint_fanout=False, escape=False,
-           settings=None):
+           settings=None, feedback_rounds=0):
     import make_bench as mb
     import flow_frame as ff
     import whole_route as wr
@@ -538,7 +540,7 @@ def _route(board, out, src, dest, k, rounds, inproc, log, run_rules, json_out=No
 
     # 4. the whole route
     wr.INPROC = inproc
-    rc, grade = wr.chain(K, os.path.join(work, 'run'), rounds, base=frame, dest=dest,
+    rc, grade = wr.chain(K, os.path.join(work, 'run'), rounds, base=frame, dest=dest, F=feedback_rounds,
                          settings={**(settings or {}), **STEP_SETTINGS, _rules.SETTING: _rules.as_setting(run_rules),
                                    **joint,
                                    **({'FANOUT_ESCAPE': '1'} if escape else {}), **escape_env,
@@ -1611,7 +1613,12 @@ def main():
                          'plain one keeps the escapes that bus\'s step laid it there (SOURCE_SHARED=0: none; '
                          '=REF,..: a plain or joint bus from those sources)')
     ap.add_argument('--k', type=int, help="the ladder's first K nets (default: the whole ladder)")
-    ap.add_argument('--rounds', type=int, default=3, help='fanout rounds (default 3)')
+    ap.add_argument('--rounds', type=int, default=2,
+                    help='the whole route\'s rounds at most, each a draw under the next seed (default 2)')
+    ap.add_argument('--feedback-rounds', type=int, default=0, metavar='F',
+                    help='after each draw that leaves nets open, up to F of the rounds under its seed, the fanout '
+                         'fed what the round before found (its crowded ends, its lanes over two vias, its open nets) '
+                         'and choosing again from that round\'s board (default 0: every round a draw)')
     ap.add_argument('--inproc', action='store_true', help='every stage in this process rather than each in its own')
     ap.add_argument('--joint-fanout', action='store_true',
                     help='after each round lays the bus at the two arrays, plan and lay every array\'s other nets '
@@ -1663,9 +1670,10 @@ def main():
     sizes = {n: getattr(a, n) for n in SIZE_ARGS if getattr(a, n) is not None}
     if a.src is None:
         sys.exit(route_buses(a.board, a.out, buses, a.k, a.rounds, a.inproc, json_out=a.json_out,
-                             joint_fanout=a.joint_fanout, escape=a.escape, **sizes)[0])
+                             joint_fanout=a.joint_fanout, escape=a.escape, feedback_rounds=a.feedback_rounds,
+                             **sizes)[0])
     sys.exit(route_bus(a.board, a.out, a.src, a.dest, a.k, a.rounds, a.inproc, json_out=a.json_out,
-                       joint_fanout=a.joint_fanout, escape=a.escape, **sizes)[0])
+                       joint_fanout=a.joint_fanout, escape=a.escape, feedback_rounds=a.feedback_rounds, **sizes)[0])
 
 
 if __name__ == '__main__':

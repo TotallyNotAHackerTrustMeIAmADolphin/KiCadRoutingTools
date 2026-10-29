@@ -121,7 +121,9 @@ right, the human, much of its copper length-matching meanders.*
 ### Running it
 
 One rung, end to end -- the fanout on our own ends, the solve, the loop, the
-route and the checks, with up to `ROUNDS` fanout rounds (default 3):
+route and the checks, with up to `ROUNDS` fanout rounds (default 2;
+`--feedback-rounds F` makes up to F of them after each draw feedback rounds,
+[below](#the-rounds-and-never-nothing-whole_routepy)):
 
 ```bash
 cd awx
@@ -1771,10 +1773,13 @@ only the fanout can move.
 What a round names -- the lanes it left open, a refused fanout's split pairs,
 the lanes the ends model reads worst when it laid nothing -- is recorded for
 the **last resort** ([the rounds](#the-rounds-and-never-nothing-whole_routepy)),
-which leaves those lanes out. The rounds no longer hand it to the next
-fanout: a round left with nets open is followed by the next seed's round, from
-the same board. (`FEEDBACK=` and `INCREMENTAL=` are still read by the fanout
-when a caller gives them; the channels below are what they price.)
+which leaves those lanes out. By default the rounds do not hand it to the
+next fanout: a round left with nets open is followed by the next seed's
+round, from the same board. With `--feedback-rounds F`, up to F rounds after
+each draw are **feedback rounds**: the round before's findings go to the
+fanout (`FEEDBACK=`, the draw's own `findings.json`), which chooses again
+incrementally from that round's board (`INCREMENTAL=`). The channels below
+are what they price.
 
 **Crowded ends repaired in the round** (`repair_ends`): before a loop that
 stopped at crowded ends hands them on, the round mends what one lane's copper
@@ -1858,7 +1863,8 @@ for some of the lanes exists:
   then open nets, vias, copper): on the zynq LVDS bus the held round laid 10,
   3, 2 and 2 nets open where the loop's best round laid 6, 0, 2 and 2;
 - a round that lays nothing, or leaves nets open, is followed by **round 1
-  again under the next seed**, up to `ROUNDS`: every solve of a round -- the
+  again under the next seed**, up to `ROUNDS` (default 2): every solve of a
+  round -- the
   joint ends and their checks, the escape plans, the round's solve and the
   loop's re-solves -- searches under the step's seed plus the round less one
   (`cp_seed`: `BUS_SEED`, else CP-SAT's default, so round 1 is as before),
@@ -1867,6 +1873,15 @@ for some of the lanes exists:
   cleaned 1 of 9 rounds left open and made 4 worse, where another draw of the
   same board laid clean in 5 of 12; over four boards the step left 2 nets
   open against 4, in 42 minutes against 74;
+- with `--feedback-rounds F` (default 0), up to F of those rounds after each
+  draw that leaves nets open are **feedback rounds** under its seed instead:
+  the fanout is fed the round before's findings
+  ([feedback](#feedback-whole_feedbackpy)) and chooses again incrementally
+  from that round's board, the passives where the draw's cap step left them;
+  a feedback round whose findings add nothing new, or whose fanout lays the
+  same ends after raising them, is the next draw instead. On a short DDR bus
+  whose round 1 left one net open under both of its first two seeds, a
+  feedback round after the first closed it;
 - when no round laid anything, the **last resort** is a partial plan on the
   last ends laid: the lanes the rounds named left out (else the three most
   crossed), then more, to a quarter and to half of the lanes -- never every
